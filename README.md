@@ -69,56 +69,77 @@ Disc profiles started from STP files generated on [mevirtuoso.com/cycloidal-driv
 
 ## Controller Setup (Flipsky ODESC V4.2 → Eaglepower 8308)
 
-The ODESC V4.2 advertises ODrive compatibility but ships with abandoned/forked firmware. Most of the integration time went into reverse-engineering which `odrivetool` flags actually work against it. Setup that worked, captured from notes dated 2026-02-24:
+The ODESC V4.2 advertises ODrive compatibility but ships with abandoned/forked firmware. Most of the integration time went into figuring out which `odrivetool` flags actually work against it and which gains keep the closed-loop transition from tripping a current-limit violation.
+
+The full bench transcript (every command run, in order, including the iteration history) lives in [`firmware/odrivetool-session.md`](firmware/odrivetool-session.md). The minimal "what worked" sequence is below.
 
 **Hardware**
-- Flipsky ODESC V4.2 24V
-- ODrive firmware 0.4.12 (the ODESC is essentially an ODrive 3.6 clone at this firmware level — see `firmware/ODriveFirmware_v3.6-24V_0.4.12.elf`)
-- 12 V / 30 A bench PSU during tuning
+- Flipsky ODESC V4.2 24V, ODrive-compatible firmware 0.4.12 (recovery image: `firmware/Flipsky_EDC_Default_Firmware.bin`; matching ODrive ELF: `firmware/ODriveFirmware_v3.6-24V_0.4.12.elf`)
+- 12 V / 30 A bench PSU
+- Eaglepower 8308 (90 Kv, 20 pole pairs)
+- AMT103-V incremental encoder, 8192 CPR, index pulse used
 
-**`odrivetool` sequence**
+**Power stage**
 ```python
 odrv0.erase_configuration()
-
-# Power stage
-odrv0.config.brake_resistance = 2
+odrv0.config.brake_resistance        = 2
 odrv0.config.dc_max_positive_current = 30
-# also: dc_max_negative_current / regen settings
+odrv0.config.dc_max_negative_current = -2.0
+odrv0.config.max_regen_current       = 0
+odrv0.save_configuration()
+```
 
-# Motor
-odrv0.axis0.motor.config.motor_type      = MOTOR_TYPE_PMSM_CURRENT_CONTROL
-odrv0.axis0.motor.config.pole_pairs      = <set for 8308>
-odrv0.axis0.motor.config.torque_constant = 8.27 / Kv
-odrv0.axis0.motor.config.calibration_voltage = ...
-odrv0.axis0.motor.config.current_lim          = ...
-odrv0.axis0.motor.config.requested_current_range = ...
+**Motor calibration**
+```python
+odrv0.axis0.motor.config.motor_type                   = MOTOR_TYPE_PMSM_CURRENT_CONTROL
+odrv0.axis0.motor.config.pole_pairs                   = 20
+odrv0.axis0.motor.config.torque_constant              = 8.27 / 90   # Kv = 90
+odrv0.axis0.motor.config.resistance_calib_max_voltage = 5
+odrv0.axis0.motor.config.calibration_current          = 2
+odrv0.axis0.motor.config.current_lim                  = 22
+odrv0.axis0.motor.config.requested_current_range      = 30
 
 odrv0.axis0.requested_state = AXIS_STATE_MOTOR_CALIBRATION
-# ... once happy
 odrv0.axis0.motor.config.pre_calibrated = True
+odrv0.save_configuration()
+```
 
-# Encoder (AMT103-V, incremental)
-odrv0.axis0.encoder.config.mode = ENCODER_MODE_INCREMENTAL
-odrv0.axis0.encoder.config.cpr  = 8192
+**Encoder**
+```python
+odrv0.axis0.encoder.config.mode      = ENCODER_MODE_INCREMENTAL
+odrv0.axis0.encoder.config.cpr       = 8192
 odrv0.axis0.encoder.config.use_index = True
 odrv0.axis0.requested_state = AXIS_STATE_FULL_CALIBRATION_SEQUENCE
+odrv0.axis0.encoder.config.pre_calibrated = True
+odrv0.save_configuration()
+```
 
-# Controller — start in IDLE, ramp up gains slowly
+**Controller — final low-kick gains**
+```python
 odrv0.axis0.controller.config.control_mode = CONTROL_MODE_POSITION_CONTROL
-# Set extremely low pos_gain / vel_integrator_gain to prevent the initial
-# "kick" when entering closed loop — the 8308 will overshoot at 12 V and
-# trip the headroom violation otherwise.
-odrv0.axis0.controller.config.pos_gain = ...        # very small
-odrv0.axis0.controller.config.vel_integrator_gain = ...  # very small
+
+# Walk pos/vel gains down from ODrive defaults to avoid the initial
+# "kick" tripping current_lim_violation when entering closed loop at 12 V.
+odrv0.axis0.controller.config.pos_gain            = 1.5
+odrv0.axis0.controller.config.vel_gain            = 0.0001
+odrv0.axis0.controller.config.vel_integrator_gain = 0.001
+
+# 8192 counts/sec = 1 rev/sec — cap velocity to prevent overshoot at 12 V
+odrv0.axis0.controller.config.vel_limit = 10000
+
+# Wider current headroom so transients don't trip the violation
+odrv0.axis0.motor.config.current_lim           = 20.0
+odrv0.axis0.motor.config.current_lim_tolerance = 10.0
 
 odrv0.axis0.config.startup_closed_loop_control = True
+odrv0.save_configuration()
 odrv0.reboot()
 ```
 
 **Gotchas hit**
-- Initial closed-loop "kick" tripped the DC bus headroom violation at 12 V; only fixable by walking pos/vel gains up from near-zero rather than using ODrive's stock defaults.
-- The ODESC's stock firmware blob is in `firmware/Flipsky_EDC_Default_Firmware.bin` — keep this as a recovery image.
-- `odrivetool`'s shadow_count and incremental encoder index search behave the same as on a real 3.6 board, but several of the newer config knobs from later ODrive firmware will silently no-op.
+- ODrive's stock `pos_gain = 20` blew the current-limit violation as soon as `AXIS_STATE_CLOSED_LOOP_CONTROL` engaged — `pos_gain` had to come down to ~1.5 with `vel_gain = 0.0001` before the transient settled cleanly at 12 V.
+- `current_lim_tolerance = 10.0` is generous, but anything tighter and the violation tripped on every encoder index search.
+- Several newer ODrive config knobs silently no-op on the ODESC firmware — stick to the 0.4.12 surface area.
 
 ## Why this didn't ship in the humanoid
 
